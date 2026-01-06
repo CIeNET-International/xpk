@@ -60,7 +60,7 @@ from ..core.nodepool import (
 )
 from ..core.ray import install_ray_cluster
 from ..core.mtc import install_mtc_on_cluster
-from ..core.resources import create_cluster_configmaps
+from ..core.resources import AutoprovisioningConfig, create_cluster_configmaps
 from ..core.scheduling import get_total_chips_requested_from_args
 from ..core.storage import install_storage_crd
 from ..core.system_characteristics import (
@@ -71,9 +71,9 @@ from ..core.system_characteristics import (
 )
 from ..core.vertex import create_vertex_tensorboard
 from ..core.workload import get_workload_list
-from ..utils.console import get_user_input, xpk_exit, xpk_print
+from ..utils.console import ask_for_user_consent, xpk_exit, xpk_print
 from ..utils.file import write_tmp_file
-from ..utils.execution_context import is_dry_run
+from ..utils.execution_context import is_dry_run, is_quiet
 from ..utils.validation import validate_dependencies_list, SystemDependency, should_validate_dependencies
 from . import cluster_gcluster
 from .common import set_cluster_command, validate_sub_slicing_system
@@ -110,7 +110,7 @@ def cluster_adapt(args) -> None:
   )
   add_zone_and_project(args)
 
-  if system.accelerator_type == AcceleratorType['GPU'] and not getattr(
+  if system.accelerator_type == AcceleratorType.GPU and not getattr(
       args, 'num_nodes'
   ):
     xpk_print(
@@ -180,10 +180,12 @@ def cluster_adapt(args) -> None:
   # if set_pathways_job_on_cluster_code != 0:
   #   xpk_exit(set_pathways_job_on_cluster_code)
 
-  install_kueue(args, system, autoprovisioning_config)
+  install_kueue_code = _install_kueue(args, system, autoprovisioning_config)
+  if install_kueue_code != 0:
+    xpk_exit(install_kueue_code)
 
   install_kjob(args)
-  if system.accelerator_type == AcceleratorType['GPU']:
+  if system.accelerator_type == AcceleratorType.GPU:
     prepare_gpus(system)
 
   if args.enable_ray_cluster:
@@ -378,11 +380,13 @@ def cluster_create(args) -> None:
   if set_pathways_job_on_cluster_code != 0:
     xpk_exit(set_pathways_job_on_cluster_code)
 
-  install_kueue(args, system, autoprovisioning_config)
+  install_kueue_code = _install_kueue(args, system, autoprovisioning_config)
+  if install_kueue_code != 0:
+    xpk_exit(install_kueue_code)
 
   install_kjob(args)
 
-  if system.accelerator_type == AcceleratorType['GPU']:
+  if system.accelerator_type == AcceleratorType.GPU:
     prepare_gpus(system)
 
   if args.enable_ray_cluster:
@@ -1052,7 +1056,7 @@ def run_gke_cluster_delete_command(args) -> int:
   Returns:
     0 if successful and 1 otherwise.
   """
-  if not args.force:
+  if not is_quiet():
     xpk_print('Get the name of the workloads in the cluster.')
     args.filter_by_status = 'EVERYTHING'
     return_code, return_value = get_workload_list(args)
@@ -1063,10 +1067,9 @@ def run_gke_cluster_delete_command(args) -> int:
     # Ignore Column Names line.
     if len(return_value) > 1:
       workloads = [x.split(' ')[0] for x in return_value.splitlines()][1:]
-      if workloads and not get_user_input(
+      if workloads and not ask_for_user_consent(
           f'Planning to delete {len(workloads)} workloads in the cluster'
-          f' {args.cluster} including {workloads}. \nDo you wish to delete: y'
-          ' (yes) / n (no):\n'
+          f' {args.cluster} including {workloads}. \nDo you wish to delete?'
       ):
         xpk_print('Skipping delete command.')
         return 0
@@ -1138,12 +1141,6 @@ def run_gke_cluster_create_command(
   # benefit from a larger initial `--num-nodes`. After the cluster is created,
   # the auto-scaler can reduce/increase the nodes based on the load.
 
-  # If the user passes in the gke version then we use that directly instead of the rapid release.
-  # This allows users to directly pass a specified gke version without release channel constraints.
-  rapid_release_cmd = ''
-  if args.gke_version is not None:
-    rapid_release_cmd = ' --release-channel rapid'
-
   command = (
       'gcloud beta container clusters create'
       f' {args.cluster} --project={args.project}'
@@ -1154,12 +1151,13 @@ def run_gke_cluster_create_command(
       ' --enable-autoscaling'
       ' --total-min-nodes 1 --total-max-nodes 1000'
       f' --num-nodes {args.default_pool_cpu_num_nodes}'
-      f' {args.custom_cluster_arguments}'
-      f' {rapid_release_cmd}'
       ' --enable-dns-access'
       ' --autoscaling-profile=optimize-utilization'
       ' --labels=gke_product_type=xpk'
   )
+
+  if args.gke_version:
+    command += ' --no-enable-autoupgrade'
 
   enable_ip_alias = False
 
@@ -1167,12 +1165,9 @@ def run_gke_cluster_create_command(
     enable_ip_alias = True
     command += ' --enable-master-authorized-networks --enable-private-nodes'
 
-  if system.accelerator_type == AcceleratorType['GPU']:
+  if system.accelerator_type == AcceleratorType.GPU:
     enable_ip_alias = True
-    command += (
-        ' --enable-dataplane-v2'
-        ' --enable-multi-networking --no-enable-autoupgrade'
-    )
+    command += ' --enable-dataplane-v2 --enable-multi-networking'
   else:
     command += ' --location-policy=BALANCED --scopes=storage-full,gke-default'
 
@@ -1211,6 +1206,9 @@ def run_gke_cluster_create_command(
   if len(addons) > 0:
     addons_str = ','.join(addons)
     command += f' --addons={addons_str}'
+
+  if args.custom_cluster_arguments:
+    command += f' {args.custom_cluster_arguments}'
 
   return_code = run_command_with_updates(command, 'GKE Cluster Create')
   if return_code != 0:
@@ -1272,7 +1270,11 @@ def install_kjob(args):
     xpk_exit(err_code)
 
 
-def install_kueue(args, system: SystemCharacteristics, autoprovisioning_config):
+def _install_kueue(
+    args,
+    system: SystemCharacteristics,
+    autoprovisioning_config: AutoprovisioningConfig | None,
+) -> int:
   xpk_print('Enabling Kueue on the cluster')
   autoprovisioning_enabled = False
   if autoprovisioning_config:
@@ -1282,8 +1284,8 @@ def install_kueue(args, system: SystemCharacteristics, autoprovisioning_config):
   else:
     # Determine total chips based on user specified topology.
     total_chips = get_total_chips_requested_from_args(args, system)
-  kueue_manager = KueueManager()
-  kueue_manager.install_or_upgrade(
+  kueue_manager = KueueManager(args.project, args.zone)
+  return kueue_manager.install_or_upgrade(
       KueueConfig(
           system,
           total_chips=total_chips,
@@ -1296,7 +1298,7 @@ def install_kueue(args, system: SystemCharacteristics, autoprovisioning_config):
           configure_sub_slicing=(
               FeatureFlags.SUB_SLICING_ENABLED and args.sub_slicing
           ),
-      ),
+      )
   )
 
 

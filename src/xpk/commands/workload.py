@@ -26,16 +26,15 @@ from ..core.cluster import (
     get_cluster_credentials,
     setup_k8s_env,
 )
-from ..core.commands import run_command_with_updates, run_commands, run_command_for_value
-from ..core.kueue_manager import KueueManager, SUB_SLICE_TOPOLOGY_NAME
+from ..core.commands import run_command_with_updates, run_commands
 from ..core.config import (VERTEX_TENSORBOARD_FEATURE_FLAG, XPK_CURRENT_VERSION)
 from ..core.docker_container import (
     get_main_container_docker_image,
     get_user_workload_container,
 )
+from ..core.kueue_manager import has_sub_slicing_enabled, get_installed_kueue_version, SUB_SLICING_TOPOLOGIES, LOCAL_QUEUE_NAME
 from ..core.docker_resources import get_volumes, parse_env_config
 from ..core.gcloud_context import add_zone_and_project
-from ..core.kueue_manager import LOCAL_QUEUE_NAME
 from ..core.monitoring import get_gke_outlier_dashboard
 from ..core.nap import (
     get_autoprovisioning_node_selector_args,
@@ -64,6 +63,8 @@ from ..core.scheduling import (
     get_cpu_affinity,
     get_gpu_scheduler,
     create_sub_slicing_annotations,
+    create_placement_policy_label,
+    is_placement_policy_supported,
 )
 from ..core.storage import (
     GCE_PD_TYPE,
@@ -95,7 +96,7 @@ from ..core.workload_decorators import (
     tcpx_decorator,
     tcpxo_decorator,
 )
-from ..utils.console import get_user_input, xpk_exit, xpk_print
+from ..utils.console import ask_for_user_consent, xpk_exit, xpk_print
 from packaging.version import Version
 from ..utils.file import write_tmp_file
 from ..utils.execution_context import is_dry_run
@@ -144,6 +145,7 @@ spec:
               nodeSelector:
                 {accelerator_label}
                 {machine_label}
+                {placement_policy_label}
                 {autoprovisioning_args}
               priorityClassName: {args.priority}
               hostNetwork: true
@@ -193,6 +195,8 @@ spec:
               {gpu_scheduler}
               priorityClassName: {args.priority}
               restartPolicy: Never
+              nodeSelector:
+                {placement_policy_label}
               imagePullSecrets:
               - name: {args.docker_image_pull_secret}
               hostNetwork: true
@@ -238,6 +242,8 @@ spec:
             spec:
               priorityClassName: {args.priority}
               restartPolicy: Never
+              nodeSelector:
+                {placement_policy_label}
               imagePullSecrets:
               - name: {args.docker_image_pull_secret}
               dnsPolicy: ClusterFirstWithHostNet
@@ -273,6 +279,7 @@ PW_WORKLOAD_CREATE_YAML = """
         terminationGracePeriodSeconds: {args.termination_grace_period_seconds}
         priorityClassName: {args.priority}
         nodeSelector:
+          {placement_policy_label}
           {autoprovisioning_args}
       pathwaysDir: {args.pathways_gcs_location} #This bucket needs to be created in advance.
       controller:
@@ -284,7 +291,6 @@ PW_WORKLOAD_CREATE_YAML = """
       {user_workload}
 """
 
-SUB_SLICING_TOPOLOGIES = ['2x2', '2x4', '4x4', '4x8', '8x8', '8x16', '16x16']
 SUB_SLICING_MINIMUM_KUEUE_VERSION = Version('0.13.0')
 
 
@@ -323,6 +329,11 @@ def workload_create(args) -> None:
         SystemDependency.GCLOUD,
         SystemDependency.DOCKER,
     ])
+
+  if getattr(args, 'virtual_slices', None):
+      xpk_print(f"Injecting virtual_slices into command: {args.virtual_slices}")
+      args.command = f"{args.command} --virtual_slices={args.virtual_slices}"
+
   k8s_api_client = None
   if not is_dry_run():
     k8s_api_client = setup_k8s_env(args)
@@ -487,7 +498,7 @@ def workload_create(args) -> None:
                 values: [{restart_on_exit_codes}]"""
 
   # Create the workload file based on accelerator type or workload type.
-  if system.accelerator_type == AcceleratorType['GPU']:
+  if system.accelerator_type == AcceleratorType.GPU:
     container, debugging_dashboard_id = get_user_workload_container(
         args, system
     )
@@ -519,6 +530,9 @@ def workload_create(args) -> None:
           failure_policy_rules=failure_policy_rules,
           pod_failure_policy=pod_failure_policy,
           annotations=annotations,
+          placement_policy_label=(
+              create_placement_policy_label(system, args) if is_placement_policy_supported(system) else ''
+          ),
       )
 
       sub_networks = get_cluster_subnetworks()
@@ -537,12 +551,13 @@ def workload_create(args) -> None:
           container=container,
           gpu_scheduler=gpu_scheduler,
           volumes=get_volumes(args, system),
-          storage_annotations=('\n' + (' ' * 12)).join(
-              get_storage_annotations(all_storages)
-          ),
+          storage_annotations=('\n' + (' ' * 12)).join(get_storage_annotations(all_storages)),
           service_account=service_account,
           failure_policy_rules=failure_policy_rules,
           pod_failure_policy=pod_failure_policy,
+          placement_policy_label=(
+              create_placement_policy_label(system, args) if is_placement_policy_supported(system) else ''
+          ),
       )
 
   elif args.use_pathways and ensure_pathways_workload_prerequisites(
@@ -560,6 +575,9 @@ def workload_create(args) -> None:
         user_workload=get_user_workload_for_pathways(args, system),
         local_queue_name=LOCAL_QUEUE_NAME,
         autoprovisioning_args=autoprovisioning_args,
+        placement_policy_label=(
+            create_placement_policy_label(system, args) if is_placement_policy_supported(system) else ''
+        ),
     )
   else:
     container, debugging_dashboard_id = get_user_workload_container(
@@ -570,35 +588,31 @@ def workload_create(args) -> None:
         container=container,
         vms_per_slice=(
             compute_vms_per_slice(args.sub_slicing_topology)
-            if system.accelerator_type == AcceleratorType['TPU']
+            if system.accelerator_type == AcceleratorType.TPU
             and FeatureFlags.SUB_SLICING_ENABLED
             and args.sub_slicing_topology is not None
             else system.vms_per_slice
         ),
         affinity=get_cpu_affinity(system.accelerator_type),
-        accelerator_label=create_accelerator_label(
-            system.accelerator_type, system
-        ),
+        accelerator_label=create_accelerator_label(system.accelerator_type, system),
         sub_slicing_annotations=(
             ''
-            if not FeatureFlags.SUB_SLICING_ENABLED
-            or args.sub_slicing_topology is None
-            else ('\n' + (' ' * 16)).join(
-                create_sub_slicing_annotations(args.sub_slicing_topology)
-            )
+            if not FeatureFlags.SUB_SLICING_ENABLED or args.sub_slicing_topology is None
+            else ('\n' + (' ' * 16)).join(create_sub_slicing_annotations(args.sub_slicing_topology))
+        ),
+        placement_policy_label=(
+            create_placement_policy_label(system, args) if is_placement_policy_supported(system) else ''
         ),
         machine_label=create_machine_label(system.accelerator_type, system),
         local_queue_name=LOCAL_QUEUE_NAME,
         autoprovisioning_args=autoprovisioning_args,
         volumes=get_volumes(args, system),
-        storage_annotations=('\n' + (' ' * 16)).join(
-            get_storage_annotations(all_storages)
-        ),
+        storage_annotations=('\n' + (' ' * 16)).join(get_storage_annotations(all_storages)),
         service_account=service_account,
         tpu_toleration="""
               - operator: "Exists"
                 key: google.com/tpu
-        """ if system.accelerator_type == AcceleratorType['TPU'] else '',
+        """ if system.accelerator_type == AcceleratorType.TPU else '',
         failure_policy_rules=failure_policy_rules,
         pod_failure_policy=pod_failure_policy,
     )
@@ -615,7 +629,7 @@ def workload_create(args) -> None:
 
   # Get GKE outlier dashboard for TPU
   outlier_dashboard_id = None
-  if system.accelerator_type == AcceleratorType['TPU']:
+  if system.accelerator_type == AcceleratorType.TPU:
     outlier_dashboard_id = get_gke_outlier_dashboard(args)
 
   # Outlier and debugging dashboards
@@ -683,25 +697,21 @@ def workload_create(args) -> None:
 
 
 def _validate_sub_slicing_availability():
-  return_code, value = run_command_for_value(
-      command='kubectl get topology', task='Get defined topologies'
-  )
-
+  return_code, sub_slicing_enabled = has_sub_slicing_enabled()
   if return_code != 0:
     xpk_print(
         'Error: Unable to validate sub-slicing support on a given cluster.'
     )
     xpk_exit(1)
 
-  if SUB_SLICE_TOPOLOGY_NAME not in value:
+  if not sub_slicing_enabled:
     xpk_print(
         'Error: Cluster has not been not set up for Sub-slicing. Please enable'
         ' --sub-slicing in "cluster create" command first.'
     )
     xpk_exit(1)
 
-  kueue_manager = KueueManager()
-  return_code, current_version = kueue_manager.get_installed_kueue_version()
+  return_code, current_version = get_installed_kueue_version()
   if return_code != 0:
     xpk_print(
         'Error: Unable to validate sub-slicing support on a given cluster.'
@@ -787,11 +797,10 @@ def workload_delete(args) -> None:
       xpk_exit(return_code)
     # Skip the header
     workloads = [x.split(' ')[0] for x in return_value.splitlines()][1:]
-    if workloads and not args.force:
-      will_delete = get_user_input(
+    if workloads:
+      will_delete = ask_for_user_consent(
           f'Planning to delete {len(workloads)} workloads in the cluster'
-          f' {args.cluster} including {workloads}. \nDo you wish to delete: y'
-          ' (yes) / n (no):\n'
+          f' {args.cluster} including {workloads}. \nDo you wish to delete?'
       )
   else:
     workloads = [args.workload]
